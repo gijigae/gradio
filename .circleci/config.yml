@@ -1,21 +1,27 @@
-version: 2
+version: 2.1
+orbs:
+  codecov: codecov/codecov@3.2.2
+  node: circleci/node@4.7.0
 jobs:
   build:
     docker:
-      - image: circleci/python:3.7.2-browsers
+      - image: circleci/python:3.9.2-browsers
     steps:
       - checkout
       - run: mkdir test-reports
       - restore_cache:
           key: deps1-{{ .Branch }}-{{ checksum "gradio.egg-info/requires.txt" }}
       - run:
+          name: Install ffmpeg
+          command: |
+            sudo apt update
+            sudo apt install ffmpeg -y
+      - run:
           name: Install Python deps in a venv
           command: |
             python3 -m venv venv
             . venv/bin/activate
-            pip install --upgrade pip
-            pip install -r gradio.egg-info/requires.txt
-            pip install selenium==4.0.0a6.post2
+            bash scripts/install_test_requirements.sh
       - run:
           command: |
             chromedriver --version
@@ -24,13 +30,38 @@ jobs:
           key: deps1-{{ .Branch }}-{{ checksum "gradio.egg-info/requires.txt" }}
           paths:
             - "venv"
+      - node/install:
+          node-version: 14.17.4
+          npm-version: 8.1.0
+      - run:
+          name: Build frontend
+          command: |
+            npm i pnpm -g
+            cd ui
+            pnpm i --frozen-lockfile
+            pnpm build
       - run:
           command: |
             mkdir screenshots
       - run:
           command: |
             . venv/bin/activate
-            python3 -m unittest
+            python -m black --check gradio test
+      - run:
+          command: |
+            . venv/bin/activate
+            python -m isort --profile=black --check-only gradio test
+      - run:
+          command: |
+            . venv/bin/activate
+            python -m  flake8 --ignore=E731,E501,E722,W503,E126,F401,E203 gradio test
+      - run:
+          command: |
+            . venv/bin/activate
+            coverage run -m pytest
+            coverage xml
+      - codecov/upload:
+          file: 'coverage.xml'
       - store_artifacts:
           path: /home/circleci/project/test/tmp
           destination: screenshots

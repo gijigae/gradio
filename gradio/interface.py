@@ -1,57 +1,72 @@
 """
-This is the core file in the `gradio` package, and defines the Interface class, including methods for constructing the
-interface using the input and output types.
+This is the core file in the `gradio` package, and defines the Interface class,
+including various methods for constructing an interface and then launching it.
 """
 
-import gradio
-from gradio.inputs import get_input_instance
-from gradio.outputs import get_output_instance
-from gradio import networking, strings, utils
-from gradio.interpretation import quantify_difference_in_label, get_regression_or_classification_value
-from gradio.external import load_interface
-from gradio import encryptor
-from gradio import queue
-import requests
-import random
-import time
-import webbrowser
-import inspect
-import sys
-import weakref
-import analytics
-import numpy as np
-import os
+from __future__ import annotations
+
 import copy
-import markdown2
-import json
 import csv
-from getpass import getpass
+import inspect
+import os
+import random
+import re
+import warnings
+import weakref
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
-analytics.write_key = "uxIFddIEuuUcFLf9VgH2teTEtPlWdkNy"
-analytics_url = 'https://api.gradio.app/'
-ip_address = networking.get_local_ip_address()
+from markdown_it import MarkdownIt
+from mdit_py_plugins.footnote import footnote_plugin
 
-JSON_PATH = os.path.join(os.path.dirname(gradio.__file__), "launches.json")
+from gradio import interpretation, utils
+from gradio.blocks import Blocks, Column, Row, TabItem, Tabs
+from gradio.components import (
+    Button,
+    Component,
+    Dataset,
+    Interpretation,
+    Markdown,
+    StatusTracker,
+    Variable,
+    get_component_instance,
+)
+from gradio.external import load_from_pipeline, load_interface  # type: ignore
+from gradio.flagging import CSVLogger, FlaggingCallback  # type: ignore
+from gradio.process_examples import cache_interface_examples, load_from_cache
 
-class Interface:
+if TYPE_CHECKING:  # Only import for type checking (is False at runtime).
+    import transformers
+
+
+class Interface(Blocks):
     """
-    Interfaces are created with Gradio by constructing a `gradio.Interface()` object.
+    Gradio interfaces are created by constructing a `Interface` object
+    with a locally-defined function, or with `Interface.load()` with the path
+    to a repo or by `Interface.from_pipeline()` with a Transformers Pipeline.
     """
-    instances = weakref.WeakSet()
+
+    # stores references to all currently existing Interface instances
+    instances: weakref.WeakSet = weakref.WeakSet()
 
     @classmethod
-    def get_instances(cls):
+    def get_instances(cls) -> List[Interface]:
         """
         :return: list of all current instances.
         """
-        return list(
-            Interface.instances)
+        return list(Interface.instances)
 
     @classmethod
-    def load(cls, name, src=None, api_key=None, alias=None, **kwargs):
+    def load(
+        cls,
+        name: str,
+        src: Optional[str] = None,
+        api_key: Optional[str] = None,
+        alias: Optional[str] = None,
+        **kwargs,
+    ) -> Interface:
         """
         Class method to construct an Interface from an external source repository, such as huggingface.
-        Parameters: 
+        Parameters:
         name (str): the name of the model (e.g. "gpt2"), can include the `src` as prefix (e.g. "huggingface/gpt2")
         src (str): the source of the model: `huggingface` or `gradio` (or empty if source is provided as a prefix in `name`)
         api_key (str): optional api key for use with Hugging Face Model Hub
@@ -60,540 +75,713 @@ class Interface:
         (gradio.Interface): a Gradio Interface object for the given model
         """
         interface_info = load_interface(name, src, api_key, alias)
-        interface_info.update(kwargs)
-        return cls(**interface_info)
+        kwargs = dict(interface_info, **kwargs)
+        interface = cls(**kwargs)
+        interface.api_mode = True  # So interface doesn't run pre/postprocess.
+        return interface
 
-    def __init__(self, fn, inputs=None, outputs=None, verbose=False, examples=None,
-                 examples_per_page=10, live=False,
-                 layout="unaligned", show_input=True, show_output=True,
-                 capture_session=False, interpretation=None, num_shap=2.0, theme=None, repeat_outputs_per_model=True,
-                 title=None, description=None, article=None, thumbnail=None,  
-                 css=None, server_port=None, server_name=networking.LOCALHOST_NAME, height=500, width=900,
-                 allow_screenshot=True, allow_flagging=True, flagging_options=None, encrypt=False,
-                 show_tips=False, embedding=None, flagging_dir="flagged", analytics_enabled=True, enable_queue=False):
+    @classmethod
+    def from_pipeline(cls, pipeline: transformers.Pipeline, **kwargs) -> Interface:
+        """
+        Construct an Interface from a Hugging Face transformers.Pipeline.
+        Parameters:
+        pipeline (transformers.Pipeline):
+        Returns:
+        (gradio.Interface): a Gradio Interface object from the given Pipeline
 
+        Example usage:
+            import gradio as gr
+            from transformers import pipeline
+            pipe = pipeline(model="lysandre/tiny-vit-random")
+            gr.Interface.from_pipeline(pipe).launch()
+        """
+        interface_info = load_from_pipeline(pipeline)
+        kwargs = dict(interface_info, **kwargs)
+        interface = cls(**kwargs)
+        return interface
+
+    def __init__(
+        self,
+        fn: Callable | List[Callable],
+        inputs: str | Component | List[str | Component] = None,
+        outputs: str | Component | List[str | Component] = None,
+        verbose: bool = False,
+        examples: Optional[List[Any] | List[List[Any]] | str] = None,
+        cache_examples: bool = False,
+        examples_per_page: int = 10,
+        live: bool = False,
+        layout: str = "unaligned",
+        show_input: bool = True,
+        show_output: bool = True,
+        capture_session: Optional[bool] = None,
+        interpretation: Optional[Callable | str] = None,
+        num_shap: float = 2.0,
+        theme: Optional[str] = None,
+        repeat_outputs_per_model: bool = True,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        article: Optional[str] = None,
+        thumbnail: Optional[str] = None,
+        css: Optional[str] = None,
+        height=None,
+        width=None,
+        allow_screenshot: bool = False,
+        allow_flagging: Optional[str] = None,
+        flagging_options: List[str] = None,
+        encrypt=None,
+        show_tips=None,
+        flagging_dir: str = "flagged",
+        analytics_enabled: Optional[bool] = None,
+        server_name=None,
+        server_port=None,
+        enable_queue=None,
+        api_mode=None,
+        flagging_callback: FlaggingCallback = CSVLogger(),
+    ):  # TODO: (faruk) Let's remove depreceated parameters in the version 3.0.0
         """
         Parameters:
-        fn (Callable): the function to wrap an interface around.
-        inputs (Union[str, List[Union[str, InputComponent]]]): a single Gradio input component, or list of Gradio input components. Components can either be passed as instantiated objects, or referred to by their string shortcuts. The number of input components should match the number of parameters in fn.
-        outputs (Union[str, List[Union[str, OutputComponent]]]): a single Gradio output component, or list of Gradio output components. Components can either be passed as instantiated objects, or referred to by their string shortcuts. The number of output components should match the number of values returned by fn.
-        verbose (bool): whether to print detailed information during launch.
+        fn (Union[Callable, List[Callable]]): the function to wrap an interface around.
+        inputs (Union[str, InputComponent, List[Union[str, InputComponent]]]): a single Gradio input component, or list of Gradio input components. Components can either be passed as instantiated objects, or referred to by their string shortcuts. The number of input components should match the number of parameters in fn.
+        outputs (Union[str, OutputComponent, List[Union[str, OutputComponent]]]): a single Gradio output component, or list of Gradio output components. Components can either be passed as instantiated objects, or referred to by their string shortcuts. The number of output components should match the number of values returned by fn.
+        verbose (bool): DEPRECATED. Whether to print detailed information during launch.
         examples (Union[List[List[Any]], str]): sample inputs for the function; if provided, appears below the UI components and can be used to populate the interface. Should be nested list, in which the outer list consists of samples and each inner list consists of an input corresponding to each input component. A string path to a directory of examples can also be provided. If there are multiple input components and a directory is provided, a log.csv file must be present in the directory to link corresponding inputs.
         examples_per_page (int): If examples are provided, how many to display per page.
         live (bool): whether the interface should automatically reload on change.
         layout (str): Layout of input and output panels. "horizontal" arranges them as two columns of equal height, "unaligned" arranges them as two columns of unequal height, and "vertical" arranges them vertically.
-        capture_session (bool): if True, captures the default graph and session (needed for Tensorflow 1.x)
-        interpretation (Union[Callable, str]): function that provides interpretation explaining prediction output. Pass "default" to use built-in interpreter. 
-        num_shap (float): a multiplier that determines how many examples are computed for shap-based interpretation. Increasing this value will increase shap runtime, but improve results.
+        capture_session (bool): DEPRECATED. If True, captures the default graph and session (needed for Tensorflow 1.x)
+        interpretation (Union[Callable, str]): function that provides interpretation explaining prediction output. Pass "default" to use simple built-in interpreter, "shap" to use a built-in shapley-based interpreter, or your own custom interpretation function.
+        num_shap (float): a multiplier that determines how many examples are computed for shap-based interpretation. Increasing this value will increase shap runtime, but improve results. Only applies if interpretation is "shap".
         title (str): a title for the interface; if provided, appears above the input and output components.
         description (str): a description for the interface; if provided, appears above the input and output components.
         article (str): an expanded article explaining the interface; if provided, appears below the input and output components. Accepts Markdown and HTML content.
         thumbnail (str): path to image or src to use as display picture for models listed in gradio.app/hub
-        theme (str): Theme to use - one of "default", "compact" or "huggingface".
+        theme (str): Theme to use - one of "default", "huggingface", "seafoam", "grass", "peach". Add "dark-" prefix, e.g. "dark-peach" for dark theme (or just "dark" for the default dark theme).
         css (str): custom css or path to custom css file to use with interface.
-        server_port (int): will start gradio app on this port (if available) 
-        server_name (str): to make app accessible on local network set to "0.0.0.0".
-        allow_screenshot (bool): if False, users will not see a button to take a screenshot of the interface.
-        allow_flagging (bool): if False, users will not see a button to flag an input and output.
-        flagging_options (List[str]): if not None, provides options a user must select when flagging.
-        encrypt (bool): If True, flagged data will be encrypted by key provided by creator at launch
+        allow_screenshot (bool): DEPRECATED if False, users will not see a button to take a screenshot of the interface.
+        allow_flagging (str): one of "never", "auto", or "manual". If "never" or "auto", users will not see a button to flag an input and output. If "manual", users will see a button to flag. If "auto", every prediction will be automatically flagged. If "manual", samples are flagged when the user clicks flag button. Can be set with environmental variable GRADIO_ALLOW_FLAGGING.
+        flagging_options (List[str]): if provided, allows user to select from the list of options when flagging. Only applies if allow_flagging is "manual".
+        encrypt (bool): DEPRECATED. If True, flagged data will be encrypted by key provided by creator at launch
         flagging_dir (str): what to name the dir where flagged data is stored.
-        show_tips (bool): if True, will occasionally show tips about new Gradio features
-        enable_queue (bool): if True, inference requests will be served through a queue instead of with parallel threads. Required for longer inference times (> 1min) to prevent timeout.  
+        show_tips (bool): DEPRECATED. if True, will occasionally show tips about new Gradio features
+        enable_queue (bool): DEPRECATED. if True, inference requests will be served through a queue instead of with parallel threads. Required for longer inference times (> 1min) to prevent timeout.
+        api_mode (bool): DEPRECATED. If True, will skip preprocessing steps when the Interface is called() as a function (should remain False unless the Interface is loaded from an external repo)
+        server_name (str): DEPRECATED. Name of the server to use for serving the interface - pass in launch() instead.
+        server_port (int): DEPRECATED. Port of the server to use for serving the interface - pass in launch() instead.
         """
+        super().__init__(analytics_enabled=analytics_enabled, mode="interface")
+
+        if inputs is None:
+            inputs = []
+        if outputs is None:
+            outputs = []
+
         if not isinstance(fn, list):
             fn = [fn]
-        if isinstance(inputs, list):
-            self.input_components = [get_input_instance(i) for i in inputs]
-        else:
-            self.input_components = [get_input_instance(inputs)]
-        if isinstance(outputs, list):
-            self.output_components = [get_output_instance(i) for i in outputs]
-        else:
-            self.output_components = [get_output_instance(outputs)]
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+
+        if "state" in inputs or "state" in outputs:
+            state_input_count = len([i for i in inputs if i == "state"])
+            state_output_count = len([o for o in outputs if o == "state"])
+            if state_input_count != 1 or state_output_count != 1:
+                raise ValueError(
+                    "If using 'state', there must be exactly one state input and one state output."
+                )
+            default = utils.get_default_args(fn[0])[inputs.index("state")]
+            state_variable = Variable(default_value=default)
+            inputs[inputs.index("state")] = state_variable
+            outputs[outputs.index("state")] = state_variable
+
+        self.input_components = [get_component_instance(i) for i in inputs]
+        self.output_components = [get_component_instance(o) for o in outputs]
+        for o in self.output_components:
+            o.interactive = (
+                False  # Force output components to be treated as non-interactive
+            )
 
         if repeat_outputs_per_model:
             self.output_components *= len(fn)
 
-        if interpretation is None or isinstance(interpretation, list) or callable(interpretation):
-            self.interpretation = interpretation 
+        if (
+            interpretation is None
+            or isinstance(interpretation, list)
+            or callable(interpretation)
+        ):
+            self.interpretation = interpretation
         elif isinstance(interpretation, str):
-            self.interpretation = [interpretation.lower() for _ in self.input_components]
+            self.interpretation = [
+                interpretation.lower() for _ in self.input_components
+            ]
         else:
-            raise ValueError("Invalid value for parameter: interpretation")         
-            
+            raise ValueError("Invalid value for parameter: interpretation")
+
         self.predict = fn
         self.predict_durations = [[0, 0]] * len(fn)
         self.function_names = [func.__name__ for func in fn]
         self.__name__ = ", ".join(self.function_names)
-        self.verbose = verbose
-        self.status = "OFF"
+
+        if verbose:
+            warnings.warn(
+                "The `verbose` parameter in the `Interface`"
+                "is deprecated and has no effect."
+            )
+        if allow_screenshot:
+            warnings.warn(
+                "The `allow_screenshot` parameter in the `Interface`"
+                "is deprecated and has no effect."
+            )
+
         self.live = live
         self.layout = layout
         self.show_input = show_input
         self.show_output = show_output
         self.flag_hash = random.getrandbits(32)
         self.capture_session = capture_session
+
+        if capture_session is not None:
+            warnings.warn(
+                "The `capture_session` parameter in the `Interface`"
+                " is deprecated and may be removed in the future."
+            )
+            try:
+                import tensorflow as tf
+
+                self.session = tf.get_default_graph(), tf.keras.backend.get_session()
+            except (ImportError, AttributeError):
+                # If they are using TF >= 2.0 or don't have TF,
+                # just ignore this parameter.
+                pass
+
+        if server_name is not None or server_port is not None:
+            raise DeprecationWarning(
+                "The `server_name` and `server_port` parameters in `Interface`"
+                "are deprecated. Please pass into launch() instead."
+            )
+
         self.session = None
-        self.server_name = server_name
         self.title = title
+
+        CLEANER = re.compile("<.*?>")
+
+        def clean_html(raw_html):
+            cleantext = re.sub(CLEANER, "", raw_html)
+            return cleantext
+
+        md = MarkdownIt(
+            "js-default",
+            {
+                "linkify": True,
+                "typographer": True,
+                "html": True,
+            },
+        ).use(footnote_plugin)
+
+        simple_description = None
+        if description is not None:
+            description = md.render(description)
+            simple_description = clean_html(description)
+        self.simple_description = simple_description
         self.description = description
         if article is not None:
             article = utils.readme_to_html(article)
-            article = markdown2.markdown(article, extras=["fenced-code-blocks"])
+            article = md.render(article)
         self.article = article
+
         self.thumbnail = thumbnail
-        self.theme = theme if theme is not None else os.getenv("GRADIO_THEME", "default")
+        theme = theme if theme is not None else os.getenv("GRADIO_THEME", "default")
+        self.is_space = True if os.getenv("SYSTEM") == "spaces" else False
+        DEPRECATED_THEME_MAP = {
+            "darkdefault": "default",
+            "darkhuggingface": "dark-huggingface",
+            "darkpeach": "dark-peach",
+            "darkgrass": "dark-grass",
+        }
+        VALID_THEME_SET = (
+            "default",
+            "huggingface",
+            "seafoam",
+            "grass",
+            "peach",
+            "dark",
+            "dark-huggingface",
+            "dark-seafoam",
+            "dark-grass",
+            "dark-peach",
+        )
+        if theme in DEPRECATED_THEME_MAP:
+            warnings.warn(
+                f"'{theme}' theme name is deprecated, using {DEPRECATED_THEME_MAP[theme]} instead."
+            )
+            theme = DEPRECATED_THEME_MAP[theme]
+        elif theme not in VALID_THEME_SET:
+            raise ValueError(
+                f"Invalid theme name, theme must be one of: {', '.join(VALID_THEME_SET)}"
+            )
+        self.theme = theme
+
         self.height = height
         self.width = width
+        if self.height is not None or self.width is not None:
+            warnings.warn(
+                "The `height` and `width` parameters in `Interface` "
+                "are deprecated and should be passed into launch()."
+            )
+
         if css is not None and os.path.exists(css):
             with open(css) as css_file:
                 self.css = css_file.read()
         else:
             self.css = css
-        if examples is None or isinstance(examples, str) or (isinstance(examples, list) and (len(examples) == 0 or isinstance(examples[0], list))):
+        if examples is None or (
+            isinstance(examples, list)
+            and (len(examples) == 0 or isinstance(examples[0], list))
+        ):
             self.examples = examples
+        elif (
+            isinstance(examples, list) and len(self.input_components) == 1
+        ):  # If there is only one input component, examples can be provided as a regular list instead of a list of lists
+            self.examples = [[e] for e in examples]
+        elif isinstance(examples, str):
+            if not os.path.exists(examples):
+                raise FileNotFoundError(
+                    "Could not find examples directory: " + examples
+                )
+            log_file = os.path.join(examples, "log.csv")
+            if not os.path.exists(log_file):
+                if len(self.input_components) == 1:
+                    exampleset = [
+                        [os.path.join(examples, item)] for item in os.listdir(examples)
+                    ]
+                else:
+                    raise FileNotFoundError(
+                        "Could not find log file (required for multiple inputs): "
+                        + log_file
+                    )
+            else:
+                with open(log_file) as logs:
+                    exampleset = list(csv.reader(logs))
+                    exampleset = exampleset[1:]  # remove header
+            for i, example in enumerate(exampleset):
+                for j, (component, cell) in enumerate(
+                    zip(
+                        self.input_components + self.output_components,
+                        example,
+                    )
+                ):
+                    exampleset[i][j] = component.restore_flagged(
+                        examples,
+                        cell,
+                        None,
+                    )
+            self.examples = exampleset
         else:
-            raise ValueError("Examples argument must either be a directory or a nested list, where each sublist represents a set of inputs.")
+            raise ValueError(
+                "Examples argument must either be a directory or a nested "
+                "list, where each sublist represents a set of inputs."
+            )
         self.num_shap = num_shap
         self.examples_per_page = examples_per_page
-        self.server_port = server_port
+
         self.simple_server = None
         self.allow_screenshot = allow_screenshot
-        self.allow_flagging = os.getenv("GRADIO_FLAGGING") or allow_flagging
-        self.flagging_options = flagging_options 
+
+        # For analytics_enabled and allow_flagging: (1) first check for
+        # parameter, (2) check for env variable, (3) default to True/"manual"
+        self.analytics_enabled = (
+            analytics_enabled
+            if analytics_enabled is not None
+            else os.getenv("GRADIO_ANALYTICS_ENABLED", "True") == "True"
+        )
+        if allow_flagging is None:
+            allow_flagging = os.getenv("GRADIO_ALLOW_FLAGGING", "manual")
+        if allow_flagging is True:
+            warnings.warn(
+                "The `allow_flagging` parameter in `Interface` now"
+                "takes a string value ('auto', 'manual', or 'never')"
+                ", not a boolean. Setting parameter to: 'manual'."
+            )
+            self.allow_flagging = "manual"
+        elif allow_flagging == "manual":
+            self.allow_flagging = "manual"
+        elif allow_flagging is False:
+            warnings.warn(
+                "The `allow_flagging` parameter in `Interface` now"
+                "takes a string value ('auto', 'manual', or 'never')"
+                ", not a boolean. Setting parameter to: 'never'."
+            )
+            self.allow_flagging = "never"
+        elif allow_flagging == "never":
+            self.allow_flagging = "never"
+        elif allow_flagging == "auto":
+            self.allow_flagging = "auto"
+        else:
+            raise ValueError(
+                "Invalid value for `allow_flagging` parameter."
+                "Must be: 'auto', 'manual', or 'never'."
+            )
+
+        self.flagging_options = flagging_options
+        self.flagging_callback = flagging_callback
         self.flagging_dir = flagging_dir
-        self.encrypt = encrypt
-        Interface.instances.add(self)
-        self.analytics_enabled=analytics_enabled
-        self.save_to = None
+
+        self.save_to = None  # Used for selenium tests
         self.share = None
         self.share_url = None
         self.local_url = None
-        self.embedding = embedding
-        self.show_tips = show_tips
-        self.requires_permissions = any([component.requires_permissions for component in self.input_components])
+
+        if show_tips is not None:
+            warnings.warn(
+                "The `show_tips` parameter in the `Interface` is deprecated. Please use the `show_tips` parameter in `launch()` instead"
+            )
+
+        self.requires_permissions = any(
+            [component.requires_permissions for component in self.input_components]
+        )
+
         self.enable_queue = enable_queue
 
-        data = {'fn': fn,
-                'inputs': inputs,
-                'outputs': outputs,
-                'live': live,
-                'capture_session': capture_session,
-                'ip_address': ip_address,
-                'interpretation': interpretation,
-                'embedding': embedding,
-                'allow_flagging': allow_flagging,
-                'allow_screenshot': allow_screenshot,
-                'custom_css': self.css is not None,
-                'theme': self.theme
-                }
+        self.favicon_path = None
+        self.height = height
+        self.width = width
+        if self.height is not None or self.width is not None:
+            warnings.warn(
+                "The `width` and `height` parameters in the `Interface` class"
+                "will be deprecated. Please provide these parameters"
+                "in `launch()` instead"
+            )
 
-        if self.capture_session:
-            try:
-                import tensorflow as tf
-                self.session = tf.get_default_graph(), \
-                               tf.keras.backend.get_session()
-            except (ImportError, AttributeError):
-                # If they are using TF >= 2.0 or don't have TF,
-                # just ignore this.
-                pass
+        self.encrypt = encrypt
+        if self.encrypt is not None:
+            warnings.warn(
+                "The `encrypt` parameter in the `Interface` class"
+                "will be deprecated. Please provide this parameter"
+                "in `launch()` instead"
+            )
 
-        if self.allow_flagging:
-            os.makedirs(self.flagging_dir, exist_ok=True)
+        if api_mode is not None:
+            warnings.warn("The `api_mode` parameter in the `Interface` is deprecated.")
+        self.api_mode = False
+
+        data = {
+            "fn": fn,
+            "inputs": inputs,
+            "outputs": outputs,
+            "live": live,
+            "capture_session": capture_session,
+            "ip_address": self.ip_address,
+            "interpretation": interpretation,
+            "allow_flagging": allow_flagging,
+            "allow_screenshot": allow_screenshot,
+            "custom_css": self.css is not None,
+            "theme": self.theme,
+        }
 
         if self.analytics_enabled:
-            try:
-                requests.post(analytics_url + 'gradio-initiated-analytics/',
-                              data=data, timeout=3)
-            except (requests.ConnectionError, requests.exceptions.ReadTimeout):
-                pass  # do not push analytics if no network
+            utils.initiated_analytics(data)
 
-    def __call__(self, params_per_function):
-        return self.predict[0](params_per_function)
+        utils.version_check()
+        Interface.instances.add(self)
+
+        param_names = inspect.getfullargspec(self.predict[0])[0]
+        for component, param_name in zip(self.input_components, param_names):
+            if component.label is None:
+                component.label = param_name
+        for i, component in enumerate(self.output_components):
+            if component.label is None:
+                if len(self.output_components) == 1:
+                    component.label = "output"
+                else:
+                    component.label = "output " + str(i)
+
+        self.cache_examples = cache_examples
+        if cache_examples:
+            cache_interface_examples(self)
+
+        if self.allow_flagging != "never":
+            self.flagging_callback.setup(
+                self.input_components + self.output_components, self.flagging_dir
+            )
+
+        with self:
+            if self.title:
+                Markdown(
+                    "<h1 style='text-align: center; margin-bottom: 1rem'>"
+                    + self.title
+                    + "</h1>"
+                )
+            if self.description:
+                Markdown(self.description)
+            with Row():
+                with Column(
+                    css={
+                        "background-color": "rgb(249,250,251)",
+                        "padding": "0.5rem",
+                        "border-radius": "0.5rem",
+                    }
+                ):
+                    input_component_column = Column()
+                    with input_component_column:
+                        for component in self.input_components:
+                            component.render()
+                    if self.interpretation:
+                        interpret_component_column = Column(visible=False)
+                        interpretation_set = []
+                        with interpret_component_column:
+                            for component in self.input_components:
+                                interpretation_set.append(Interpretation(component))
+                    with Row():
+                        clear_btn = Button("Clear")
+                        if not self.live:
+                            submit_btn = Button("Submit")
+                with Column(
+                    css={
+                        "background-color": "rgb(249,250,251)",
+                        "padding": "0.5rem",
+                        "border-radius": "0.5rem",
+                    }
+                ):
+                    status_tracker = StatusTracker(cover_container=True)
+                    for component in self.output_components:
+                        component.render()
+                    with Row():
+                        flag_btn = Button("Flag")
+                        if self.interpretation:
+                            interpretation_btn = Button("Interpret")
+            submit_fn = (
+                lambda *args: self.run_prediction(args)[0]
+                if len(self.output_components) == 1
+                else self.run_prediction(args)
+            )
+            if self.live:
+                for component in self.input_components:
+                    component.change(
+                        submit_fn, self.input_components, self.output_components
+                    )
+            else:
+                submit_btn.click(
+                    submit_fn,
+                    self.input_components,
+                    self.output_components,
+                    queue=self.enable_queue,
+                    status_tracker=status_tracker,
+                )
+            clear_btn.click(
+                lambda: [
+                    component.default_value
+                    if hasattr(component, "default_value")
+                    else None
+                    for component in self.input_components + self.output_components
+                ]
+                + [True]
+                + ([False] if self.interpretation else []),
+                [],
+                self.input_components
+                + self.output_components
+                + [input_component_column]
+                + ([interpret_component_column] if self.interpretation else []),
+            )
+            if self.examples:
+                examples = Dataset(
+                    components=self.input_components,
+                    samples=self.examples,
+                    type="index",
+                )
+
+                def load_example(example_id):
+                    processed_examples = [
+                        component.preprocess_example(sample)
+                        for component, sample in zip(
+                            self.input_components, self.examples[example_id]
+                        )
+                    ]
+                    if self.cache_examples:
+                        processed_examples += load_from_cache(self, example_id)
+                    if len(processed_examples) == 1:
+                        return processed_examples[0]
+                    else:
+                        return processed_examples
+
+                examples._click_no_postprocess(
+                    load_example,
+                    inputs=[examples],
+                    outputs=self.input_components
+                    + (self.output_components if self.cache_examples else []),
+                )
+
+            flag_btn._click_no_preprocess(
+                lambda *flag_data: self.flagging_callback.flag(flag_data),
+                inputs=self.input_components + self.output_components,
+                outputs=[],
+            )
+            if self.interpretation:
+                interpretation_btn._click_no_preprocess(
+                    lambda *data: self.interpret(data) + [False, True],
+                    inputs=self.input_components + self.output_components,
+                    outputs=interpretation_set
+                    + [input_component_column, interpret_component_column],
+                    status_tracker=status_tracker,
+                )
+
+    def __call__(self, *params):
+        if (
+            self.api_mode
+        ):  # skip the preprocessing/postprocessing if sending to a remote API
+            output = self.run_prediction(params, called_directly=True)
+        else:
+            output = self.process(params)
+        return output[0] if len(output) == 1 else output
 
     def __str__(self):
         return self.__repr__()
 
     def __repr__(self):
-        repr = "Gradio Interface for: {}".format(", ".join(fn.__name__ for fn in self.predict))
-        repr += "\n" + "-"*len(repr)
+        repr = "Gradio Interface for: {}".format(
+            ", ".join(fn.__name__ for fn in self.predict)
+        )
+        repr += "\n" + "-" * len(repr)
         repr += "\ninputs:"
         for component in self.input_components:
             repr += "\n|-{}".format(str(component))
         repr += "\noutputs:"
         for component in self.output_components:
-            repr+= "\n|-{}".format(str(component))
+            repr += "\n|-{}".format(str(component))
         return repr
-        
-    def get_config_file(self):
-        config = {
-            "input_components": [
-                iface.get_template_context()
-                for iface in self.input_components],
-            "output_components": [
-                iface.get_template_context()
-                for iface in self.output_components],
-            "function_count": len(self.predict),
-            "live": self.live,
-            "examples_per_page": self.examples_per_page,
-            "layout": self.layout,
-            "show_input": self.show_input,
-            "show_output": self.show_output,
-            "title": self.title,
-            "description": self.description,
-            "article": self.article,
-            "theme": self.theme,
-            "css": self.css,
-            "thumbnail": self.thumbnail,
-            "allow_screenshot": self.allow_screenshot,
-            "allow_flagging": self.allow_flagging,
-            "flagging_options": self.flagging_options,
-            "allow_interpretation": self.interpretation is not None,
-            "allow_embedding": self.embedding is not None,
-            "queue": self.enable_queue
-        }
-        try:
-            param_names = inspect.getfullargspec(self.predict[0])[0]
-            for iface, param in zip(config["input_components"], param_names):
-                if not iface["label"]:
-                    iface["label"] = param.replace("_", " ")
-            for i, iface in enumerate(config["output_components"]):
-                outputs_per_function = int(len(self.output_components) / len(self.predict))
-                function_index = i // outputs_per_function
-                component_index = i - function_index * outputs_per_function
-                ret_name = "Output " + str(component_index + 1) if outputs_per_function > 1 else "Output"
-                if iface["label"] is None:
-                    iface["label"] = ret_name
-                if len(self.predict) > 1:
-                    iface["label"] = self.function_names[function_index].replace("_", " ") + ": " + iface["label"]
-                    
-        except ValueError:
-            pass
-        if self.examples is not None:
-            if isinstance(self.examples, str):
-                if not os.path.exists(self.examples):
-                    raise FileNotFoundError("Could not find examples directory: " + self.examples)
-                log_file = os.path.join(self.examples, "log.csv")
-                if not os.path.exists(log_file):
-                    if len(self.input_components) == 1:
-                        examples = [[item] for item in os.listdir(self.examples)]
-                    else:
-                        raise FileNotFoundError("Could not find log file (required for multiple inputs): " + log_file)
-                else:
-                    with open(log_file) as logs:
-                        examples = list(csv.reader(logs)) 
-                        examples = examples[1:] #remove header
-                for i, example in enumerate(examples):
-                    for j, (interface, cell) in enumerate(zip(self.input_components + self.output_components, example)):
-                        examples[i][j] = interface.restore_flagged(cell)
-                config["examples"] = examples
-                config["examples_dir"] = self.examples
-            else:
-                config["examples"] = self.examples
-        return config
 
-    def run_prediction(self, processed_input, return_duration=False):
+    def render_basic_interface(self):
+        Interface(
+            fn=self.predict,
+            inputs=self.input_components,
+            outputs=self.output_components,
+            examples=self.examples,
+            examples_per_page=self.examples_per_page,
+            live=self.live,
+            layout=self.layout,
+            interpretation=self.interpretation,
+            num_shap=self.num_shap,
+            title=self.title,
+            description=self.description,
+            article=self.article,
+            allow_flagging=self.allow_flagging,
+            flagging_options=self.flagging_options,
+            flagging_dir=self.flagging_dir,
+        )
+
+    def run_prediction(
+        self,
+        processed_input: List[Any],
+        called_directly: bool = False,
+    ) -> List[Any] | Tuple[List[Any], List[float]]:
+        """
+        Runs the prediction function with the given (already processed) inputs.
+        Parameters:
+        processed_input (list): A list of processed inputs.
+        called_directly (bool): Whether the prediction is being called
+            directly (i.e. as a function, not through the GUI).
+        Returns:
+        predictions (list): A list of predictions (not post-processed).
+        """
+        if self.api_mode:  # Serialize the input
+            processed_input = [
+                input_component.serialize(processed_input[i], called_directly)
+                for i, input_component in enumerate(self.input_components)
+            ]
         predictions = []
-        durations = []
+        output_component_counter = 0
+
         for predict_fn in self.predict:
-            start = time.time()
-            if self.capture_session and self.session is not None:
+            if self.capture_session and self.session is not None:  # For TF 1.x
                 graph, sess = self.session
                 with graph.as_default(), sess.as_default():
                     prediction = predict_fn(*processed_input)
             else:
-                try:
-                    prediction = predict_fn(*processed_input)
-                except ValueError as exception:
-                    if str(exception).endswith("is not an element of this graph."):
-                        raise ValueError(strings.en["TF1_ERROR"])
-                    else:
-                        raise exception
-            duration = time.time() - start
+                prediction = predict_fn(*processed_input)
 
             if len(self.output_components) == len(self.predict):
                 prediction = [prediction]
-            
-            durations.append(duration)
-            predictions.extend(prediction)
-        
-        if return_duration:
-            return predictions, durations
-        else:
-            return predictions
 
-    def process(self, raw_input):
+            if self.api_mode:  # Serialize the input
+                prediction_ = copy.deepcopy(prediction)
+                prediction = []
+                for (
+                    pred
+                ) in (
+                    prediction_
+                ):  # Done this way to handle both single interfaces with multiple outputs and Parallel() interfaces
+                    prediction.append(
+                        self.output_components[output_component_counter].deserialize(
+                            pred
+                        )
+                    )
+                    output_component_counter += 1
+
+            predictions.extend(prediction)
+
+        return predictions
+
+    def process(self, raw_input: List[Any]) -> Tuple[List[Any], List[float]]:
         """
-        :param raw_input: a list of raw inputs to process and apply the prediction(s) on.
+        First preprocesses the input, then runs prediction using
+        self.run_prediction(), then postprocesses the output.
+        Parameters:
+        raw_input: a list of raw inputs to process and apply the prediction(s) on.
+        Returns:
         processed output: a list of processed  outputs to return as the prediction(s).
         duration: a list of time deltas measuring inference time for each prediction fn.
         """
-        processed_input = [input_component.preprocess(raw_input[i])
-                           for i, input_component in enumerate(self.input_components)]
-        predictions, durations = self.run_prediction(processed_input, return_duration=True)
-        processed_output = [output_component.postprocess(
-            predictions[i]) if predictions[i] is not None else None for i, output_component in enumerate(self.output_components)]
-        return processed_output, durations
-    
-    def interpret(self, raw_input):
+        processed_input = [
+            input_component.preprocess(raw_input[i])
+            for i, input_component in enumerate(self.input_components)
+        ]
+        predictions = self.run_prediction(processed_input)
+        processed_output = [
+            output_component.postprocess(predictions[i])
+            if predictions[i] is not None
+            else None
+            for i, output_component in enumerate(self.output_components)
+        ]
+        return processed_output
+
+    def interpret(self, raw_input: List[Any]) -> List[Any]:
+        return [
+            {"original": raw_value, "interpretation": interpretation}
+            for interpretation, raw_value in zip(
+                interpretation.run_interpret(self, raw_input)[0], raw_input
+            )
+        ]
+
+    def test_launch(self) -> None:
         """
-        Runs the interpretation command for the machine learning model. Handles both the "default" out-of-the-box
-        interpretation for a certain set of UI component types, as well as the custom interpretation case.
-        :param raw_input: a list of raw inputs to apply the interpretation(s) on.
+        Passes a few samples through the function to test if the inputs/outputs
+        components are consistent with the function parameter and return values.
         """
-        if isinstance(self.interpretation, list):  # Either "default" or "shap"
-            processed_input = [input_component.preprocess(raw_input[i])
-                            for i, input_component in enumerate(self.input_components)]
-            original_output = self.run_prediction(processed_input)
-            scores, alternative_outputs = [], []
-            for i, (x, interp) in enumerate(zip(raw_input, self.interpretation)):
-                print(i, interp)
-                if interp=="default":
-                    input_component = self.input_components[i]
-                    neighbor_raw_input = list(raw_input)
-                    if input_component.interpret_by_tokens:
-                        tokens, neighbor_values, masks =  input_component.tokenize(x)
-                        interface_scores = []
-                        alternative_output = []
-                        for neighbor_input in neighbor_values:
-                            neighbor_raw_input[i] = neighbor_input
-                            processed_neighbor_input = [input_component.preprocess(neighbor_raw_input[i])
-                                            for i, input_component in enumerate(self.input_components)]
-                            neighbor_output = self.run_prediction(processed_neighbor_input)
-                            processed_neighbor_output = [output_component.postprocess(
-                                neighbor_output[i]) for i, output_component in enumerate(self.output_components)]
-
-                            alternative_output.append(processed_neighbor_output)
-                            interface_scores.append(quantify_difference_in_label(self, original_output, neighbor_output))
-                        alternative_outputs.append(alternative_output)
-                        scores.append(
-                            input_component.get_interpretation_scores(
-                                raw_input[i], neighbor_values, interface_scores, masks=masks, tokens=tokens))                
-                    else:
-                        neighbor_values, interpret_kwargs = input_component.get_interpretation_neighbors(x)
-                        interface_scores = []
-                        alternative_output = []
-                        for neighbor_input in neighbor_values:
-                            neighbor_raw_input[i] = neighbor_input
-                            processed_neighbor_input = [input_component.preprocess(neighbor_raw_input[i])
-                                            for i, input_component in enumerate(self.input_components)]
-                            neighbor_output = self.run_prediction(processed_neighbor_input)
-                            processed_neighbor_output = [output_component.postprocess(
-                                neighbor_output[i]) for i, output_component in enumerate(self.output_components)]
-
-                            alternative_output.append(processed_neighbor_output)
-                            interface_scores.append(quantify_difference_in_label(self, original_output, neighbor_output))
-                        alternative_outputs.append(alternative_output)
-                        interface_scores = [-score for score in interface_scores]
-                        scores.append(
-                            input_component.get_interpretation_scores(
-                                raw_input[i], neighbor_values, interface_scores, **interpret_kwargs))
-                elif interp == "shap":
-                    try:
-                        import shap
-                    except (ImportError, ModuleNotFoundError):
-                        raise ValueError("The package `shap` is required for this interpretation method. Try: `pip install shap`")
-                    input_component = self.input_components[i]
-                    if not(input_component.interpret_by_tokens):
-                        raise ValueError("Input component {} does not support `shap` interpretation".format(input_component))
-                    
-                    tokens, _, masks = input_component.tokenize(x)
-                    
-                    def get_masked_prediction(binary_mask):  # construct a masked version of the input
-                        masked_xs = input_component.get_masked_inputs(tokens, binary_mask)  
-                        preds = []
-                        for masked_x in masked_xs:
-                            processed_masked_input = copy.deepcopy(processed_input) 
-                            processed_masked_input[i] = input_component.preprocess(masked_x) 
-                            new_output = self.run_prediction(processed_masked_input)
-                            pred = get_regression_or_classification_value(self, original_output, new_output)
-                            preds.append(pred)
-                        return np.array(preds)
-
-                    num_total_segments = len(tokens) 
-                    explainer = shap.KernelExplainer(get_masked_prediction, np.zeros((1, num_total_segments)))
-                    shap_values = explainer.shap_values(np.ones((1, num_total_segments)), nsamples=int(self.num_shap*num_total_segments), silent=True)
-                    scores.append(input_component.get_interpretation_scores(raw_input[i], None, shap_values[0], masks=masks, tokens=tokens))
-                    alternative_outputs.append([])
-                elif interp is None:
-                    scores.append(None)
-                    alternative_outputs.append([])
-                else:
-                    raise ValueError("Uknown intepretation method: {}".format(interp))
-            return scores, alternative_outputs
-        else:  # custom interpretation function
-            processed_input = [input_component.preprocess(raw_input[i])
-                               for i, input_component in enumerate(self.input_components)]
-            interpreter = self.interpretation
-
-            if self.capture_session and self.session is not None:
-                graph, sess = self.session
-                with graph.as_default(), sess.as_default():
-                    interpretation = interpreter(*processed_input)
-            else:
-                try:
-                    interpretation = interpreter(*processed_input)
-                except ValueError as exception:
-                    if str(exception).endswith("is not an element of this graph."):
-                        raise ValueError(strings.en["TF1_ERROR"])
-                    else:
-                        raise exception
-            if len(raw_input) == 1:
-                interpretation = [interpretation]
-            return interpretation, []
-
-    def close(self):
-        if self.simple_server and not (self.simple_server.fileno() == -1):  # checks to see if server is running
-            print("Closing Gradio server on port {}...".format(self.server_port))
-            networking.close_server(self.simple_server)
-
-    def run_until_interrupted(self, thread, path_to_local_server):
-        try:
-            while True:
-                time.sleep(0.5)
-        except (KeyboardInterrupt, OSError):
-            print("Keyboard interruption in main thread... closing server.")
-            thread.keep_running = False
-            networking.url_ok(path_to_local_server)  # Hit the server one more time to close it
-            if self.enable_queue:
-                queue.close()
-
-    def test_launch(self):
         for predict_fn in self.predict:
-            print("Test launch: {}()...".format(predict_fn.__name__), end=' ')
-
+            print("Test launch: {}()...".format(predict_fn.__name__), end=" ")
             raw_input = []
             for input_component in self.input_components:
-                if input_component.test_input is None:  # If no test input is defined for that input interface
+                if input_component.test_input is None:
                     print("SKIPPED")
                     break
-                else:  # If a test input is defined for each interface object
+                else:
                     raw_input.append(input_component.test_input)
             else:
                 self.process(raw_input)
                 print("PASSED")
                 continue
 
-    def launch(self, inline=None, inbrowser=None, share=False, debug=False, auth=None, auth_message=None, private_endpoint=None, prevent_thread_lock=False):
+    def integrate(self, comet_ml=None, wandb=None, mlflow=None) -> None:
         """
-        Launches the webserver that serves the UI for the interface.
+        A catch-all method for integrating with other libraries.
+        Should be run after launch()
         Parameters:
-        inline (bool): whether to display in the interface inline on python notebooks.
-        inbrowser (bool): whether to automatically launch the interface in a new tab on the default browser.
-        share (bool): whether to create a publicly shareable link from your computer for the interface.
-        debug (bool): if True, and the interface was launched from Google Colab, prints the errors in the cell output.
-        auth (Callable, Union[Tuple[str, str], List[Tuple[str, str]]]): If provided, username and password (or list of username-password tuples) required to access interface. Can also provide function that takes username and password and returns True if valid login.
-        auth_message (str): If provided, HTML message provided on login page.
-        Returns:
-        app (flask.Flask): Flask app object
-        path_to_local_server (str): Locally accessible link
-        share_url (str): Publicly accessible link (if share=True)
+            comet_ml (Experiment): If a comet_ml Experiment object is provided,
+            will integrate with the experiment and appear on Comet dashboard
+            wandb (module): If the wandb module is provided, will integrate
+            with it and appear on WandB dashboard
+            mlflow (module): If the mlflow module  is provided, will integrate
+            with the experiment and appear on ML Flow dashboard
         """
-        # Alert user if a more recent version of the library exists
-        utils.version_check()
-
-        # Set up local flask server
-        config = self.get_config_file()
-        self.config = config
-        if auth and not callable(auth) and not isinstance(auth[0], tuple) and not isinstance(auth[0], list):
-            auth = [auth]
-        self.auth = auth
-        self.auth_message = auth_message
-
-        # Request key for encryption
-        if self.encrypt:
-            self.encryption_key = encryptor.get_key(getpass("Enter key for encryption: "))
-
-        # Launch local flask server
-        server_port, path_to_local_server, app, thread = networking.start_server(
-            self, self.server_name, self.server_port, self.auth)
-        self.local_url = path_to_local_server
-        self.server_port = server_port
-        self.status = "RUNNING"
-        self.server = app
-
-        # Count number of launches
-        launch_counter()
-
-        # If running in a colab or not able to access localhost, automatically create a shareable link        
-        is_colab = utils.colab_check()
-        if is_colab or not(networking.url_ok(path_to_local_server)):  
-            share = True
-            if is_colab:
-                if debug:
-                    print(strings.en["COLAB_DEBUG_TRUE"])
-                else:
-                    print(strings.en["COLAB_DEBUG_FALSE"])
-        else:
-            print(strings.en["RUNNING_LOCALLY"].format(path_to_local_server))
-        if is_colab and self.requires_permissions:
-            print(strings.en["MEDIA_PERMISSIONS_IN_COLAB"])
-
-        if private_endpoint is not None:
-            share = True
-        # Set up shareable link 
-        self.share = share
-
-        if share:
-            if private_endpoint:
-                print(strings.en["PRIVATE_LINK_MESSAGE"])
-            else:
-                print(strings.en["SHARE_LINK_MESSAGE"])
-            try:
-                share_url = networking.setup_tunnel(server_port, private_endpoint)
-                self.share_url = share_url
-                print(strings.en["SHARE_LINK_DISPLAY"].format(share_url))
-            except RuntimeError:
-                send_error_analytics(self.analytics_enabled)
-                share_url = None
-        else:
-            print(strings.en["PUBLIC_SHARE_TRUE"])
-            share_url = None
-
-        # Open a browser tab with the interface.
-        if inbrowser: 
-            if share:
-                webbrowser.open(share_url) 
-            else:
-                webbrowser.open(path_to_local_server) 
-                
-        # Check if running in a Python notebook in which case, display inline
-        if inline is None:
-            inline = utils.ipython_check()
-        if inline:
-            try:                
-                from IPython.display import IFrame, display
-                # Embed the remote interface page if on google colab; otherwise, embed the local page.
-                print(strings.en["INLINE_DISPLAY_BELOW"])
-                if share:
-                    while not networking.url_ok(share_url):
-                        time.sleep(1)
-                    display(IFrame(share_url, width=self.width, height=self.height))
-                else:
-                    display(IFrame(path_to_local_server, width=self.width, height=self.height))
-            except ImportError:
-                pass  # IPython is not available so does not print inline.
-
-        send_launch_analytics(analytics_enabled=self.analytics_enabled, inbrowser=inbrowser, is_colab=is_colab, 
-                              share=share, share_url=share_url)
-
-        show_tip(self)
-
-        # Run server perpetually under certain circumstances
-        if debug or int(os.getenv('GRADIO_DEBUG', 0))==1:
-            while True:
-                sys.stdout.flush()
-                time.sleep(0.1)
-        is_in_interactive_mode = bool(getattr(sys, 'ps1', sys.flags.interactive))
-        if not prevent_thread_lock and not is_in_interactive_mode:
-            self.run_until_interrupted(thread, path_to_local_server)
-
-
-        return app, path_to_local_server, share_url
-
-
-    def integrate(self, comet_ml=None, wandb=None, mlflow=None):
         analytics_integration = ""
         if comet_ml is not None:
             analytics_integration = "CometML"
@@ -607,76 +795,57 @@ class Interface:
         if wandb is not None:
             analytics_integration = "WandB"
             if self.share_url is not None:
-                wandb.log({"Gradio panel": wandb.Html('<iframe src="' + self.share_url + '" width="' + str(self.width) + '" height="' + str(self.height) + '" frameBorder="0"></iframe>')})
+                wandb.log(
+                    {
+                        "Gradio panel": wandb.Html(
+                            '<iframe src="'
+                            + self.share_url
+                            + '" width="'
+                            + str(self.width)
+                            + '" height="'
+                            + str(self.height)
+                            + '" frameBorder="0"></iframe>'
+                        )
+                    }
+                )
             else:
-                print("The WandB integration requires you to `launch(share=True)` first.")
+                print(
+                    "The WandB integration requires you to "
+                    "`launch(share=True)` first."
+                )
         if mlflow is not None:
             analytics_integration = "MLFlow"
             if self.share_url is not None:
-                mlflow.log_param("Gradio Interface Share Link",
-                                 self.share_url)
+                mlflow.log_param("Gradio Interface Share Link", self.share_url)
             else:
-                mlflow.log_param("Gradio Interface Local Link",
-                                 self.local_url)
-        if self.analytics_enabled:
-            if not analytics_integration:
-                data = {'integration': analytics_integration}
-                try:
-                    requests.post(analytics_url +
-                                  'gradio-integration-analytics/',
-                                  data=data, timeout=3)
-                except (
-                requests.ConnectionError, requests.exceptions.ReadTimeout):
-                    pass  # do not push analytics if no network
-
-def show_tip(io):
-    if not(io.show_tips) or random.random() < 0.5:  # Only show tip every other use.
-        return
-    print(random.choice(strings.en.TIPS))
-
-def launch_counter():
-    try:
-        if not os.path.exists(JSON_PATH):
-            launches = {"launches": 1}
-            with open(JSON_PATH, "w+") as j:
-                json.dump(launches, j)
-        else:
-            with open(JSON_PATH) as j:
-                launches = json.load(j)
-            launches["launches"] += 1
-            if launches["launches"] in [25, 50]:
-                print(strings.en["BETA_INVITE"])
-            with open(JSON_PATH, "w") as j:
-                j.write(json.dumps(launches))
-    except:
-        pass
-
-def send_error_analytics(analytics_enabled):
-    data = {'error': 'RuntimeError in launch method'}
-    if analytics_enabled:
-        try:
-            requests.post(analytics_url + 'gradio-error-analytics/',
-                            data=data, timeout=3)
-        except (requests.ConnectionError, requests.exceptions.ReadTimeout):
-            pass  # do not push analytics if no network
-
-def send_launch_analytics(analytics_enabled, inbrowser, is_colab, share, share_url):
-    launch_method = 'browser' if inbrowser else 'inline'
-    if analytics_enabled:
-        data = {
-            'launch_method': launch_method,
-            'is_google_colab': is_colab,
-            'is_sharing_on': share,
-            'share_url': share_url,
-            'ip_address': ip_address
-        }
-        try:
-            requests.post(analytics_url + 'gradio-launched-analytics/',
-                            data=data, timeout=3)
-        except (requests.ConnectionError, requests.exceptions.ReadTimeout):
-            pass  # do not push analytics if no network
+                mlflow.log_param("Gradio Interface Local Link", self.local_url)
+        if self.analytics_enabled and analytics_integration:
+            data = {"integration": analytics_integration}
+            utils.integration_analytics(data)
 
 
-def reset_all():
+class TabbedInterface(Blocks):
+    def __init__(
+        self, interface_list: List[Interface], tab_names: Optional[List[str]] = None
+    ):
+        if tab_names is None:
+            tab_names = ["Tab {}".format(i) for i in range(len(interface_list))]
+        super().__init__()
+        with self:
+            with Tabs():
+                for (interface, tab_name) in zip(interface_list, tab_names):
+                    with TabItem(label=tab_name):
+                        interface.render_basic_interface()
+
+
+def close_all(verbose: bool = True) -> None:
     for io in Interface.get_instances():
-        io.close()
+        io.close(verbose)
+
+
+def reset_all() -> None:
+    warnings.warn(
+        "The `reset_all()` method has been renamed to `close_all()` "
+        "and will be deprecated. Please use `close_all()` instead."
+    )
+    close_all()
